@@ -189,6 +189,7 @@ def build_default_config() -> dict:
             ".KQ":  "^KQ11",       # Korea (KOSDAQ)
             ".HK":  "^HSI",        # Hong Kong (Hang Seng)
             ".SI":  "^STI",        # Singapore (Straits Times)
+            ".BK":  "TDEX.BK",     # Thailand (SET50 ETF; Yahoo serves no history for ^SET.BK)
             ".L":   "^FTSE",       # London (FTSE 100)
             ".DE":  "^GDAXI",      # Germany (DAX)
             ".PA":  "^FCHI",       # Paris (CAC 40)
