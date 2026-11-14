@@ -209,10 +209,14 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
     if data is None:
         # yf.download catches every error, a rate limit included, and returns
         # an empty frame. Ticker.history raises the rate limit, so it is retried.
+        # auto_adjust=False keeps prices as traded: a dividend-adjusted series
+        # rewrites every past bar for dividends paid after the analysis date,
+        # so a backtest would quote prices that never traded. Total-return
+        # settlement reads its own adjusted closes (market.get_closes).
         downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
             start=start_str,
             end=end_str,
-            auto_adjust=True,
+            auto_adjust=False,
             actions=False,
         ))
         if downloaded is None:
