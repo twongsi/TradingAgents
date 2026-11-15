@@ -181,6 +181,28 @@ class TraderProposal(BaseModel):
         default=None,
         description="Optional sizing guidance, e.g. '5% of portfolio'.",
     )
+    # Filled only when the options-wheel rules are in the instructions.
+    macro_regime_tier: str | None = Field(
+        default=None,
+        description=(
+            "Options-wheel mode only: TIER_0_EXTENDED, TIER_1_WATCH_ZONE, "
+            "TIER_2_ACCUMULATION or TIER_3_DEEP_VALUE. Omit otherwise."
+        ),
+    )
+    execution_vehicle: str | None = Field(
+        default=None,
+        description=(
+            "Options-wheel mode only: COVERED_CALL_OVERWRITE, CASH_SECURED_PUT, "
+            "HYBRID_SPOT_PLUS_CSP or EQUITY_SPOT. Omit otherwise."
+        ),
+    )
+    earnings_blackout_status: str | None = Field(
+        default=None,
+        description=(
+            "Options-wheel mode only: CLEAR, ETF_EXEMPT, PRE_EARNINGS_BLACKOUT, "
+            "POST_EARNINGS_COOLDOWN or EARNINGS_DATES_UNAVAILABLE. Omit otherwise."
+        ),
+    )
 
     @field_validator("entry_price", "stop_loss", mode="before")
     @classmethod
@@ -206,6 +228,12 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
                          ("Stop Loss", proposal.stop_loss),
                          ("Position Sizing", proposal.position_sizing)):
         parts.extend(["", f"**{label}**: {value if value is not None and value != '' else 'not provided'}"])
+    # Wheel fields appear only when the trader filled them (options-wheel mode).
+    for label, value in (("Macro Regime Tier", proposal.macro_regime_tier),
+                         ("Execution Vehicle", proposal.execution_vehicle),
+                         ("Earnings Blackout", proposal.earnings_blackout_status)):
+        if value:
+            parts.extend(["", f"**{label}**: {value}"])
     parts.extend([
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",

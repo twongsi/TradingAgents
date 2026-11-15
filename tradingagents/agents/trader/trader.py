@@ -15,6 +15,33 @@ from tradingagents.agents.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.dataflows.config import get_config
+
+# Added to the Trader's instructions when the run's ``wheel_strategy`` is on. It
+# reads the wheel tool's output from the technical market report.
+WHEEL_MANDATE = (
+    "Options-wheel mode is on. Read the Weekly EMA tier, earnings blackout gate and wheel leg "
+    "from the technical market report and apply these rules, highest priority first:\n"
+    "- EARNINGS BLACKOUT: if the gate is blocked (PRE_EARNINGS_BLACKOUT, POST_EARNINGS_COOLDOWN "
+    "or EARNINGS_DATES_UNAVAILABLE), do not open new short calls or puts; hold option collateral "
+    "in cash or T-bills until the safe resume date, or until the date is confirmed.\n"
+    "- TIER_0_EXTENDED (more than 5% above the Weekly EMA100): covered call, delta about +0.20 to "
+    "+0.25, about 35 DTE.\n"
+    "- TIER_1_WATCH_ZONE (0% to 5% above the Weekly EMA100): cash-secured put struck near the "
+    "Weekly EMA100, about 35 DTE.\n"
+    "- TIER_2_ACCUMULATION (at or below the Weekly EMA100, or a 20% drawdown): half spot, half "
+    "out-of-the-money cash-secured put.\n"
+    "- TIER_3_DEEP_VALUE (at or below the Weekly EMA200, or a 35% drawdown): spot purchase.\n"
+    "- Thai (.BK) listings have no single-stock options: use the dividend regime's tier and "
+    "entry levels for spot only.\n"
+    "Option premiums in the report are model estimates; size from them, but say the live quote "
+    "must be checked. Fill macro_regime_tier, execution_vehicle and earnings_blackout_status. "
+)
+
+
+def wheel_mandate() -> str:
+    """The wheel rules when the run's wheel_strategy is on, else nothing."""
+    return WHEEL_MANDATE if get_config().get("wheel_strategy") else ""
 
 
 def create_trader(llm):
@@ -57,6 +84,7 @@ def create_trader(llm):
                     "instrument's quote currency (for example 189.5), never a percentage "
                     "or a range; convert a percentage distance to the price level it "
                     "implies, or omit the field if you cannot state a number. "
+                    + wheel_mandate()
                     + NO_EXTERNAL_TOOLS
                     + get_language_instruction()
                 ),

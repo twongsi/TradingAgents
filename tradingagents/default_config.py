@@ -21,6 +21,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_MAX_TOOL_ROUNDS":      "max_tool_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
+    "TRADINGAGENTS_WHEEL_STRATEGY":       "wheel_strategy",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
@@ -126,6 +127,10 @@ def build_default_config() -> dict:
         # Checkpoint/resume: when True, LangGraph saves state after each node
         # so a crashed run can resume from the last successful step.
         "checkpoint_enabled": False,
+        # Options-wheel mode: when True the Market Analyst also gets the Weekly
+        # EMA100/200 wheel tool and the Trader the wheel and earnings-blackout
+        # rules. Off by default, so ordinary runs are unchanged.
+        "wheel_strategy": False,
         # Output language for analyst reports and final decision
         # Internal agent debate stays in English for reasoning quality
         "output_language": "English",

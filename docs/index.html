@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="th" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TradingAgents — Weekly EMA100/200 & Options Wheel Dashboard</title>
+  <script src="https://cdn.tailwindcss.com/3.4.5"></script>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+  <style>
+    body { background-color: #0b0f19; color: #e2e8f0; font-family: 'Inter', sans-serif; }
+    .glass-card { background: rgba(17, 24, 39, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.6); }
+  </style>
+</head>
+<body class="min-h-screen antialiased">
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    const FALLBACK_DATA = [
+      {"Ticker":"QQQ","Spot ($)":679.89,"Weekly EMA100 ($)":618.50,"Dist EMA100 (%)":9.93,"Drawdown 2Y (%)":-10.88,"CDC Zone":"YELLOW","Tactical Tier":"TIER_0_EXTENDED","Earnings Gate":"ETF_EXEMPT","Wheel Action":"SELL COVERED CALL","Strike":"$715 CALL","Delta":"+0.20","Premium ($/sh)":5.10,"Target Exit / Entry ($)":720.10,"Annualized Yield (%)":7.82},
+      {"Ticker":"NVDA","Spot ($)":162.85,"Weekly EMA100 ($)":164.20,"Dist EMA100 (%)":-0.82,"Drawdown 2Y (%)":-33.09,"CDC Zone":"YELLOW","Tactical Tier":"TIER_2_ACCUMULATION","Earnings Gate":"PRE_EARNINGS_BLACKOUT","Wheel Action":"50% SPOT ONLY (PARK CSP UNTIL 2026-11-23)","Strike":"$145 PUT","Delta":"-0.25","Premium ($/sh)":3.85,"Target Exit / Entry ($)":141.15,"Annualized Yield (%)":27.67},
+      {"Ticker":"AMD","Spot ($)":134.50,"Weekly EMA100 ($)":142.80,"Dist EMA100 (%)":-5.81,"Drawdown 2Y (%)":-38.40,"CDC Zone":"RED","Tactical Tier":"TIER_2_ACCUMULATION","Earnings Gate":"CLEAR","Wheel Action":"50% SPOT + 50% CSP","Strike":"$120 PUT","Delta":"-0.26","Premium ($/sh)":3.15,"Target Exit / Entry ($)":116.85,"Annualized Yield (%)":27.38},
+      {"Ticker":"GOOGL","Spot ($)":198.40,"Weekly EMA100 ($)":199.80,"Dist EMA100 (%)":-0.70,"Drawdown 2Y (%)":-21.90,"CDC Zone":"YELLOW","Tactical Tier":"TIER_2_ACCUMULATION","Earnings Gate":"CLEAR","Wheel Action":"50% SPOT + 50% CSP","Strike":"$185 PUT","Delta":"-0.27","Premium ($/sh)":3.40,"Target Exit / Entry ($)":181.60,"Annualized Yield (%)":19.16},
+      {"Ticker":"ASML","Spot ($)":692.00,"Weekly EMA100 ($)":765.00,"Dist EMA100 (%)":-9.54,"Drawdown 2Y (%)":-36.50,"CDC Zone":"RED","Tactical Tier":"TIER_3_DEEP_VALUE","Earnings Gate":"CLEAR","Wheel Action":"100% BUY SPOT","Strike":"$685 PUT","Delta":"-0.44","Premium ($/sh)":16.80,"Target Exit / Entry ($)":668.20,"Annualized Yield (%)":25.57},
+      {"Ticker":"MSFT","Spot ($)":442.10,"Weekly EMA100 ($)":431.50,"Dist EMA100 (%)":2.46,"Drawdown 2Y (%)":-16.80,"CDC Zone":"YELLOW","Tactical Tier":"TIER_1_WATCH_ZONE","Earnings Gate":"CLEAR","Wheel Action":"SELL CSP @ EMA100","Strike":"$430 PUT","Delta":"-0.34","Premium ($/sh)":6.45,"Target Exit / Entry ($)":423.55,"Annualized Yield (%)":15.63},
+      {"Ticker":"AMZN","Spot ($)":228.60,"Weekly EMA100 ($)":201.40,"Dist EMA100 (%)":13.51,"Drawdown 2Y (%)":-9.20,"CDC Zone":"GREEN","Tactical Tier":"TIER_0_EXTENDED","Earnings Gate":"CLEAR","Wheel Action":"SELL COVERED CALL","Strike":"$245 CALL","Delta":"+0.23","Premium ($/sh)":2.65,"Target Exit / Entry ($)":247.65,"Annualized Yield (%)":12.09},
+      {"Ticker":"META","Spot ($)":615.20,"Weekly EMA100 ($)":524.00,"Dist EMA100 (%)":17.40,"Drawdown 2Y (%)":-8.50,"CDC Zone":"GREEN","Tactical Tier":"TIER_0_EXTENDED","Earnings Gate":"CLEAR","Wheel Action":"SELL COVERED CALL","Strike":"$660 CALL","Delta":"+0.24","Premium ($/sh)":7.80,"Target Exit / Entry ($)":667.80,"Annualized Yield (%)":13.22},
+      {"Ticker":"AAPL","Spot ($)":244.80,"Weekly EMA100 ($)":218.50,"Dist EMA100 (%)":12.04,"Drawdown 2Y (%)":-7.40,"CDC Zone":"YELLOW","Tactical Tier":"TIER_0_EXTENDED","Earnings Gate":"CLEAR","Wheel Action":"SELL COVERED CALL","Strike":"$260 CALL","Delta":"+0.21","Premium ($/sh)":2.30,"Target Exit / Entry ($)":262.30,"Annualized Yield (%)":9.80}
+    ];
+
+    function normCDF(x) {
+      const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+      const sign = x < 0 ? -1 : 1;
+      const absX = Math.abs(x) / Math.sqrt(2.0);
+      const t = 1.0 / (1.0 + p * absX);
+      const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX);
+      return 0.5 * (1.0 + sign * y);
+    }
+
+    function calcBlackScholes(type, spot, strike, dte, iv = 0.28, r = 0.0425) {
+      const T = Math.max(dte / 365.0, 0.001);
+      const d1 = (Math.log(spot / strike) + (r + 0.5 * iv * iv) * T) / (iv * Math.sqrt(T));
+      const d2 = d1 - iv * Math.sqrt(T);
+      if (type === "CALL") {
+        return { price: Math.max(0.05, spot * normCDF(d1) - strike * Math.exp(-r * T) * normCDF(d2)), delta: normCDF(d1) };
+      } else {
+        return { price: Math.max(0.05, strike * Math.exp(-r * T) * normCDF(-d2) - spot * normCDF(-d1)), delta: normCDF(d1) - 1.0 };
+      }
+    }
+
+    function App() {
+      const [rows, setRows] = useState(FALLBACK_DATA);
+      const [dataSource, setDataSource] = useState("Embedded Snapshot (2026-11-13)");
+      const [selectedTicker, setSelectedTicker] = useState("AMZN");
+      const [simSpot, setSimSpot] = useState(243.50);
+      const [simDte, setSimDte] = useState(21);
+      const [rollMode, setRollMode] = useState("AUTO_CDC");
+
+      useEffect(() => {
+        const urls = ["./latest_wheel_scan.json", "../reports/latest_wheel_scan.json"];
+        (async () => {
+          for (const u of urls) {
+            try {
+              const res = await fetch(u, { cache: "no-store" });
+              if (res.ok) {
+                const j = await res.json();
+                if (Array.isArray(j) && j.length > 0) {
+                  setRows(j);
+                  setDataSource(`Live JSON (${u})`);
+                  return;
+                }
+              }
+            } catch (e) {}
+          }
+        })();
+      }, []);
+
+      const activeRow = useMemo(() => rows.find(r => r.Ticker === selectedTicker) || rows[0], [rows, selectedTicker]);
+
+      useEffect(() => {
+        if (activeRow) setSimSpot(Number(activeRow["Spot ($)"]));
+      }, [selectedTicker]);
+
+      const rollEvaluation = useMemo(() => {
+        if (!activeRow) return null;
+        const rawStrikeStr = String(activeRow["Strike"] || "$245 CALL");
+        const isCall = rawStrikeStr.toUpperCase().includes("CALL");
+        const optType = isCall ? "CALL" : "PUT";
+        const currStrike = parseFloat(rawStrikeStr.replace(/[^0-9.]/g, "")) || Number(activeRow["Spot ($)"]);
+        const entryPrem = Number(activeRow["Premium ($/sh)"]) || 3.0;
+        const baseIv = activeRow.Ticker === "NVDA" || activeRow.Ticker === "AMD" ? 0.40 : 0.25;
+        const step = currStrike >= 100 ? 5 : 2.5;
+
+        const getSkewIv = (st) => {
+          const dist = (st - simSpot) / simSpot;
+          if (!isCall && dist < 0) return baseIv * (1 + Math.abs(dist) * 1.2);
+          if (isCall && dist > 0) return Math.max(0.12, baseIv * (1 - dist * 0.4));
+          return baseIv * (1 + Math.abs(dist) * 0.3);
+        };
+
+        const currBS = calcBlackScholes(optType, simSpot, currStrike, simDte, getSkewIv(currStrike));
+        const profitPct = ((entryPrem - currBS.price) / entryPrem) * 100.0;
+        const newDte = simDte + 30;
+
+        const validCandidates = [];
+        let firstCandidate = null;
+        for (let i = 1; i <= 15; i++) {
+          const candStrike = isCall ? currStrike + i * step : currStrike - i * step;
+          if (candStrike <= step) break;
+          const nxtBS = calcBlackScholes(optType, simSpot, candStrike, newDte, getSkewIv(candStrike));
+          const netCred = nxtBS.price - currBS.price;
+          const cand = { strike: candStrike, price: nxtBS.price, delta: nxtBS.delta, netCredit: netCred };
+          if (i === 1) firstCandidate = cand;
+          if (netCred >= 0.0) validCandidates.push(cand);
+        }
+
+        const cdc = activeRow["CDC Zone"] || "YELLOW";
+        let resolvedMode = rollMode;
+        if (rollMode === "AUTO_CDC") {
+          if (isCall) resolvedMode = cdc === "GREEN" ? "MAX_STRIKE_SHIFT" : (cdc === "BLUE" ? "BALANCED_50_50" : "MAX_NET_CREDIT");
+          else resolvedMode = cdc === "RED" ? "MAX_STRIKE_SHIFT" : (cdc === "YELLOW" ? "BALANCED_50_50" : "MAX_NET_CREDIT");
+        }
+
+        let chosen = firstCandidate;
+        if (validCandidates.length > 0) {
+          if (resolvedMode === "MAX_NET_CREDIT") chosen = validCandidates[0];
+          else if (resolvedMode === "BALANCED_50_50") chosen = validCandidates[Math.floor(validCandidates.length / 2)];
+          else chosen = validCandidates[validCandidates.length - 1];
+        }
+
+        const newEffectiveLevel = isCall
+          ? (chosen.strike + entryPrem + chosen.netCredit).toFixed(2)
+          : (chosen.strike - (entryPrem + chosen.netCredit)).toFixed(2);
+
+        return {
+          optType, currStrike, entryPrem,
+          currMark: currBS.price.toFixed(2),
+          currDelta: currBS.delta.toFixed(2),
+          profitPct: profitPct.toFixed(1),
+          newStrike: chosen.strike,
+          newDte,
+          nextStoPrem: chosen.price.toFixed(2),
+          netCredit: chosen.netCredit.toFixed(2),
+          resolvedMode,
+          newEffectiveLevel
+        };
+      }, [activeRow, simSpot, simDte, rollMode]);
+
+      return (
+        <div className="max-w-7xl mx-auto px-4 py-8 space-y-6">
+          <header className="glass-card rounded-2xl p-6 flex justify-between items-center">
+            <div>
+              <h1 className="text-2xl font-bold text-white">TradingAgents — Weekly EMA100/200 & Options Wheel Dashboard</h1>
+              <p className="text-xs text-slate-400 mt-1">Data Source: {dataSource}</p>
+            </div>
+          </header>
+
+          <section className="glass-card rounded-2xl p-6 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-slate-700 text-slate-400">
+                  <th className="py-2 px-2">Ticker</th>
+                  <th className="py-2 px-2">Spot</th>
+                  <th className="py-2 px-2">Weekly EMA100</th>
+                  <th className="py-2 px-2">Dist EMA100</th>
+                  <th className="py-2 px-2">CDC</th>
+                  <th className="py-2 px-2">Tactical Tier</th>
+                  <th className="py-2 px-2">Earnings Gate</th>
+                  <th className="py-2 px-2">Wheel Action</th>
+                  <th className="py-2 px-2">Strike</th>
+                  <th className="py-2 px-2">Premium</th>
+                  <th className="py-2 px-2">Breakeven / Exit</th>
+                  <th className="py-2 px-2">Yield/Yr</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800">
+                {rows.map(r => (
+                  <tr key={r.Ticker} onClick={() => setSelectedTicker(r.Ticker)} className="cursor-pointer hover:bg-slate-800/60">
+                    <td className="py-2.5 px-2 font-bold text-white">{r.Ticker}</td>
+                    <td className="py-2.5 px-2">${r["Spot ($)"]}</td>
+                    <td className="py-2.5 px-2">${r["Weekly EMA100 ($)"]}</td>
+                    <td className="py-2.5 px-2">{r["Dist EMA100 (%)"]}%</td>
+                    <td className="py-2.5 px-2">{r["CDC Zone"]}</td>
+                    <td className="py-2.5 px-2">{r["Tactical Tier"]}</td>
+                    <td className="py-2.5 px-2">{r["Earnings Gate"] || "CLEAR"}</td>
+                    <td className="py-2.5 px-2 font-semibold text-indigo-300">{r["Wheel Action"]}</td>
+                    <td className="py-2.5 px-2 text-amber-300 font-mono">{r["Strike"]}</td>
+                    <td className="py-2.5 px-2 text-emerald-300">${r["Premium ($/sh)"]}</td>
+                    <td className="py-2.5 px-2 font-semibold">${r["Target Exit / Entry ($)"]}</td>
+                    <td className="py-2.5 px-2 text-emerald-400 font-bold">{r["Annualized Yield (%)"]}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+
+          {rollEvaluation && (
+            <section className="glass-card rounded-2xl p-6 space-y-4">
+              <div className="flex justify-between items-center">
+                <h2 className="text-base font-bold text-white">21 DTE Roll Simulator: {activeRow.Ticker} ({activeRow.Strike})</h2>
+                <div className="flex gap-2">
+                  {["AUTO_CDC", "MAX_STRIKE_SHIFT", "BALANCED_50_50", "MAX_NET_CREDIT"].map(m => (
+                    <button key={m} onClick={() => setRollMode(m)} className={`px-2.5 py-1 rounded text-xs ${rollMode === m ? "bg-indigo-600 text-white" : "bg-slate-800 text-slate-300"}`}>{m}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                <div className="bg-slate-900 p-4 rounded-xl">
+                  <div className="text-slate-400">Mark Price & Profit Capture</div>
+                  <div className="text-lg font-bold text-white mt-1">${rollEvaluation.currMark} ({rollEvaluation.profitPct}%)</div>
+                </div>
+                <div className="bg-slate-900 p-4 rounded-xl">
+                  <div className="text-slate-400">Selected Mode: {rollEvaluation.resolvedMode}</div>
+                  <div className="text-lg font-bold text-indigo-300 mt-1">Roll to ${rollEvaluation.newStrike} (Credit +${rollEvaluation.netCredit})</div>
+                </div>
+                <div className="bg-slate-900 p-4 rounded-xl">
+                  <div className="text-slate-400">New Effective Exit / Breakeven</div>
+                  <div className="text-lg font-bold text-emerald-400 mt-1">${rollEvaluation.newEffectiveLevel}</div>
+                </div>
+              </div>
+            </section>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

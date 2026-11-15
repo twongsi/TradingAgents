@@ -2,14 +2,32 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.analysts.turn import take_turn
 from tradingagents.agents.context import get_instrument_context_from_state, get_language_instruction
+from tradingagents.agents.quant_wheel_tools import get_weekly_macro_drawdown_regime
 from tradingagents.agents.tools import get_indicators, get_stock_data, get_verified_market_snapshot
+from tradingagents.dataflows.config import get_config
 
-# The tools this analyst is offered; its tool node is built from the same tuple.
-TOOLS = (
+# The tools this analyst is offered by default.
+BASE_TOOLS = (
     get_stock_data,
     get_indicators,
     get_verified_market_snapshot,
 )
+# Offered as well when the run's ``wheel_strategy`` is on.
+WHEEL_TOOLS = (get_weekly_macro_drawdown_regime,)
+# The tool node can run every tool the analyst may be offered.
+TOOLS = BASE_TOOLS + WHEEL_TOOLS
+
+WHEEL_INSTRUCTION = (
+    "\n\nOptions-wheel mode is on: also call get_weekly_macro_drawdown_regime once and report its "
+    "Weekly EMA100/EMA200 tier, 2-year drawdown, Weekly CDC zone, earnings blackout gate and wheel "
+    "leg for the asset and the benchmark. Its option premiums are model estimates from realised "
+    "volatility, not market quotes: say so when you quote them."
+)
+
+
+def offered_tools() -> tuple:
+    """The tools offered on this run, by the configured wheel_strategy."""
+    return TOOLS if get_config().get("wheel_strategy") else BASE_TOOLS
 
 
 def create_market_analyst(llm):
@@ -17,6 +35,8 @@ def create_market_analyst(llm):
     def market_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = get_instrument_context_from_state(state)
+        tools = offered_tools()
+        wheel_on = tools is TOOLS
 
         system_message = (
             """You are a trading assistant tasked with analyzing financial markets. Your role is to select the **most relevant indicators** for a given market condition or trading strategy from the following list. The goal is to choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
@@ -49,6 +69,7 @@ Before writing the final report, call get_verified_market_snapshot for this tick
 
 Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+            + (WHEEL_INSTRUCTION if wheel_on else "")
             + get_language_instruction()
         )
 
@@ -70,11 +91,11 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
         )
 
         prompt = prompt.partial(system_message=system_message)
-        prompt = prompt.partial(tool_names=", ".join([tool.name for tool in TOOLS]))
+        prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        result, report = take_turn(prompt, llm, TOOLS, state["messages"])
+        result, report = take_turn(prompt, llm, tools, state["messages"])
 
         return {
             "messages": [result],
