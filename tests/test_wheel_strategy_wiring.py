@@ -44,7 +44,8 @@ def test_market_analyst_offers_the_wheel_tool_only_in_wheel_mode(monkeypatch, on
 @pytest.mark.parametrize("on", [False, True])
 def test_trader_gets_the_wheel_rules_only_in_wheel_mode(monkeypatch, on):
     _config(monkeypatch, trader, on)
-    assert ("EARNINGS BLACKOUT" in trader.wheel_mandate()) is on
+    assert ("EARNINGS GATE" in trader.wheel_mandate()) is on
+    assert ("COVERED CALLS need 100 shares" in trader.wheel_mandate()) is on
 
 
 @pytest.mark.unit
@@ -83,3 +84,27 @@ def test_earnings_dates_are_sorted_unique_days(monkeypatch):
     monkeypatch.setattr(wheel.yf, "Ticker", lambda s: SimpleNamespace(
         get_earnings_dates=lambda limit=12: pd.DataFrame({"EPS": [1, 2, 3]}, index=idx)))
     assert wheel.earnings_dates("NVDA") == ["2026-08-26", "2026-11-19"]
+
+
+@pytest.mark.unit
+def test_portfolio_options_validate_and_render():
+    from tradingagents.portfolio import PortfolioContext
+    book = PortfolioContext.model_validate({
+        "positions": [{"ticker": "NVDA", "quantity": 200}],
+        "options": [{"ticker": "nvda", "option_type": "call", "strike": 190, "expiry": "2026-12-18",
+                     "contracts": 2, "entry_premium": 3.1}],
+    })
+    assert book.shares_in("NVDA") == 200 and book.shares_in("AAPL") == 0
+    assert book.options_in("NVDA")[0].option_type == "CALL"
+    assert "Open short CALL: 2 x 190.00 strike, expiry 2026-12-18" in book.render("NVDA")
+    with pytest.raises(ValueError):
+        PortfolioContext.model_validate({"options": [{"ticker": "NVDA", "option_type": "CALL", "strike": 1,
+                                                      "expiry": "18/12/2026", "contracts": 1, "entry_premium": 1}]})
+
+
+@pytest.mark.unit
+def test_run_state_carries_the_portfolio_as_data():
+    from tradingagents.graph.propagation import Propagator
+    assert Propagator().create_initial_state("NVDA", "2026-11-13")["portfolio_book"] == {}
+    state = Propagator().create_initial_state("NVDA", "2026-11-13", portfolio_book={"cash": 1.0})
+    assert state["portfolio_book"] == {"cash": 1.0}

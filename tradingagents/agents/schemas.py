@@ -193,7 +193,7 @@ class TraderProposal(BaseModel):
         default=None,
         description=(
             "Options-wheel mode only: COVERED_CALL_OVERWRITE, CASH_SECURED_PUT, "
-            "HYBRID_SPOT_PLUS_CSP or EQUITY_SPOT. Omit otherwise."
+            "HYBRID_SPOT_PLUS_CSP, EQUITY_SPOT or NONE (wait). Omit otherwise."
         ),
     )
     earnings_blackout_status: str | None = Field(

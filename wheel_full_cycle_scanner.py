@@ -3,6 +3,7 @@
 ไฟล์: wheel_full_cycle_scanner.py
 วิธีรัน:
   python wheel_full_cycle_scanner.py --date 2026-11-13 --output-dir reports [--notify-telegram]
+  python wheel_full_cycle_scanner.py --portfolio my_book.json   # ตรวจหุ้นที่ถือ + review สัญญาที่เปิดอยู่
 
 สแกน Weekly EMA100/200 + The Wheel ของหุ้นสหรัฐฯ ไม่ต้องใช้ API key ของ AI
 ราคาออปชันเป็นค่าประมาณจาก Black-Scholes (realised volatility) ไม่ใช่ราคาตลาดจริง
@@ -19,15 +20,14 @@ import urllib.request
 
 import pandas as pd
 
-from tradingagents.agents.quant_wheel_tools import analyze_weekly_wheel_regime
+from tradingagents.agents.quant_wheel_tools import analyze_weekly_wheel_regime, free_cash
+from tradingagents.portfolio import load_portfolio
 
 US_WATCHLIST = ["QQQ", "NVDA", "GOOGL", "AMD", "ASML", "MSFT", "AMZN", "META", "AAPL"]
 
 
 def _wheel_row(res: dict) -> dict:
     """One scanner row from analyze_weekly_wheel_regime's result."""
-    tier = res["tactical_regime_tier"]
-    gate = res["earnings_blackout_gate"]
     opt = res["wheel_option_recommendation"]
     row = {
         "Ticker": res["symbol"],
@@ -36,54 +36,69 @@ def _wheel_row(res: dict) -> dict:
         "Dist EMA100 (%)": res["dist_to_ema100_pct"],
         "Drawdown 2Y (%)": res["max_2yr_drawdown_pct"],
         "CDC Zone": res["cdc_zone"],
-        "Tactical Tier": tier,
-        "Earnings Gate": gate["blackout_status"],
+        "Tactical Tier": res["tactical_regime_tier"],
+        "Tier Reason": res["tier_reason"],
+        "Earnings Gate": res["earnings_blackout_gate"]["blackout_status"],
+        "Wheel Action": res["wheel_action"],
+        "Strike": "", "Delta": "", "Premium ($/sh)": "", "Target Exit / Entry ($)": "", "Annualized Yield (%)": "",
+        "Notes": "; ".join(res["notes"]),
     }
-    if tier == "TIER_0_EXTENDED":
-        action = "SELL COVERED CALL" if not gate["is_blackout"] else f"HOLD ({gate['blackout_status']})"
-        row.update({
-            "Wheel Action": action,
-            "Strike": f"${opt['call_strike']:.0f} CALL",
-            "Delta": f"+{opt['call_delta']:.2f}",
-            "Premium ($/sh)": opt["call_premium_per_share"],
-            "Target Exit / Entry ($)": opt["effective_call_away_price"],
-            "Annualized Yield (%)": opt["annualized_yield_pct"],
-        })
-    else:
-        if gate["is_blackout"]:
-            resume = gate["safe_resume_date"] or "earnings date is confirmed"
-            action = f"SPOT ONLY (NO NEW CSP UNTIL {resume})"
-        else:
-            action = {
-                "TIER_1_WATCH_ZONE": "SELL CSP @ EMA100",
-                "TIER_2_ACCUMULATION": "50% SPOT + 50% CSP",
-            }.get(tier, "100% BUY SPOT")
-        row.update({
-            "Wheel Action": action,
-            "Strike": f"${opt['strike_price']:.0f} PUT",
-            "Delta": f"{opt['put_delta']:.2f}",
-            "Premium ($/sh)": opt["put_premium_per_share"],
-            "Target Exit / Entry ($)": opt["net_breakeven_price"],
-            "Annualized Yield (%)": opt["annualized_yield_pct"],
-        })
+    if opt is not None and "call_strike" in opt:
+        row.update({"Strike": f"${opt['call_strike']:.0f} CALL", "Delta": f"+{opt['call_delta']:.2f}",
+                    "Premium ($/sh)": opt["call_premium_per_share"],
+                    "Target Exit / Entry ($)": opt["effective_call_away_price"],
+                    "Annualized Yield (%)": opt["annualized_yield_pct"]})
+    elif opt is not None:
+        row.update({"Strike": f"${opt['strike_price']:.0f} PUT", "Delta": f"{opt['put_delta']:.2f}",
+                    "Premium ($/sh)": opt["put_premium_per_share"],
+                    "Target Exit / Entry ($)": opt["net_breakeven_price"],
+                    "Annualized Yield (%)": opt["annualized_yield_pct"]})
     return row
+
+
+def _review_rows(res: dict) -> list[dict]:
+    """One row per open short option on the symbol, with its roll verdict."""
+    rows = []
+    for r in res.get("open_option_reviews", []):
+        plan = r.get("selected_roll_plan") or {}
+        rows.append({
+            "Ticker": res["symbol"], "Type": r["option_type"], "Strike": r["strike"], "Expiry": r["expiry"],
+            "Contracts": r["contracts"], "DTE": r["remaining_dte"],
+            "Mark ($/sh)": r.get("current_mark_price", ""), "Profit (%)": r.get("profit_capture_pct", ""),
+            "Verdict": r["decision_verdict"],
+            "Roll To": plan.get("new_strike", ""), "Roll Net Credit": plan.get("net_credit_per_share", ""),
+        })
+    return rows
 
 
 def run_full_wheel_portfolio_scan(
     tickers: list[str],
     trade_date: str,
     dte_days: int = 35,
+    portfolio=None,
 ) -> pd.DataFrame:
-    rows, skipped = [], []
-    for sym in tickers:
-        res = analyze_weekly_wheel_regime(sym, trade_date, dte_days)
+    """Scan ``tickers``; with a PortfolioContext, check holdings and review open options.
+
+    The open-option reviews are attached as ``df.attrs["open_option_reviews"]``.
+    """
+    rows, reviews, skipped = [], [], []
+    symbols = list(dict.fromkeys(tickers + ([o.ticker.upper() for o in portfolio.options] if portfolio else [])))
+    cash = free_cash(portfolio) if portfolio is not None else None
+    for sym in symbols:
+        shares = portfolio.shares_in(sym) if portfolio is not None else None
+        options = [o.model_dump() for o in portfolio.options_in(sym)] if portfolio is not None else None
+        res = analyze_weekly_wheel_regime(sym, trade_date, dte_days, shares_held=shares,
+                                          open_options=options, cash_available=cash)
         if "error" in res:
             skipped.append(f"{sym}: {res['error']}")
             continue
         rows.append(_wheel_row(res))
+        reviews.extend(_review_rows(res))
     for line in skipped:
         print(f"[!] ข้าม {line}")
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    df.attrs["open_option_reviews"] = pd.DataFrame(reviews)
+    return df
 
 
 def markdown_table(df: pd.DataFrame) -> str:
@@ -140,9 +155,13 @@ if __name__ == "__main__":
     parser.add_argument("--dte", type=int, default=35)
     parser.add_argument("--output-dir", type=str, default="reports")
     parser.add_argument("--notify-telegram", action="store_true")
+    parser.add_argument("--portfolio", type=str, default=None,
+                        help="portfolio JSON (positions + open short options); keeps covered calls to held shares")
     args = parser.parse_args()
 
-    df_wheel = run_full_wheel_portfolio_scan(US_WATCHLIST, trade_date=args.date, dte_days=args.dte)
+    book = load_portfolio(args.portfolio) if args.portfolio else None
+    df_wheel = run_full_wheel_portfolio_scan(US_WATCHLIST, trade_date=args.date, dte_days=args.dte, portfolio=book)
+    df_reviews = df_wheel.attrs["open_option_reviews"]
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -150,10 +169,18 @@ if __name__ == "__main__":
     df_wheel.to_csv(out_dir / f"wheel_scan_{args.date}.csv", index=False, encoding="utf-8-sig")
     df_wheel.to_json(out_dir / "latest_wheel_scan.json", orient="records", indent=2, force_ascii=False)
     md_content = f"# Weekly EMA100/200 & The Wheel Scan ({args.date})\n\n{markdown_table(df_wheel)}\n"
+    if book is None:
+        md_content += "\n_No portfolio given: covered calls assume 100+ shares are held._\n"
+    if not df_reviews.empty:
+        md_content += f"\n## Open short options\n\n{markdown_table(df_reviews)}\n"
+        df_reviews.to_csv(out_dir / f"open_options_{args.date}.csv", index=False, encoding="utf-8-sig")
     (out_dir / f"wheel_scan_{args.date}.md").write_text(md_content, encoding="utf-8")
     (out_dir / "latest_wheel_scan.md").write_text(md_content, encoding="utf-8")
 
     print(df_wheel.to_string(index=False))
+    if not df_reviews.empty:
+        print("\n=== OPEN SHORT OPTIONS ===")
+        print(df_reviews.to_string(index=False))
     if args.notify_telegram:
         send_telegram_message(telegram_summary(
             f"Wheel scan {args.date}", df_wheel, ["Ticker", "Tactical Tier", "Earnings Gate", "Wheel Action"]))

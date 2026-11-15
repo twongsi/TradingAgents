@@ -17,7 +17,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from tradingagents.dataflows.symbols import normalize_symbol
 
@@ -30,12 +32,47 @@ class Position(BaseModel):
     average_price: float | None = Field(default=None, description="Average entry price per unit")
 
 
+class OptionPosition(BaseModel):
+    """An open short option the caller holds (the wheel sells calls and puts)."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    ticker: str = Field(description="Underlying symbol, e.g. NVDA")
+    option_type: Literal["CALL", "PUT"] = Field(description="CALL or PUT")
+    strike: float = Field(gt=0, description="Strike price")
+    expiry: str = Field(description="Expiry date, YYYY-MM-DD")
+    contracts: int = Field(gt=0, description="Number of short contracts")
+    entry_premium: float = Field(ge=0, description="Premium received per share when sold")
+
+    @field_validator("option_type", mode="before")
+    @classmethod
+    def _upper(cls, v):
+        return v.upper() if isinstance(v, str) else v
+
+    @field_validator("expiry")
+    @classmethod
+    def _date(cls, v):
+        from datetime import date
+        date.fromisoformat(v)
+        return v
+
+
 class PortfolioContext(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
 
     cash: float | None = Field(default=None, description="Free cash available")
     currency: str | None = Field(default=None, description="Currency label for cash and prices")
     positions: list[Position] = Field(default_factory=list)
+    options: list[OptionPosition] = Field(default_factory=list, description="Open short options")
+
+    def shares_in(self, ticker: str) -> float:
+        """Units held of ``ticker`` (0.0 when none is listed)."""
+        return float(sum(p.quantity for p in self.positions_in(ticker)))
+
+    def options_in(self, ticker: str) -> list[OptionPosition]:
+        """Open short options on ``ticker``, under any broker spelling."""
+        symbol = normalize_symbol(ticker)
+        return [o for o in self.options if normalize_symbol(o.ticker) == symbol]
 
     def positions_in(self, ticker: str) -> list[Position]:
         """The holdings of the instrument the run prices for ``ticker``, under any
@@ -60,6 +97,9 @@ class PortfolioContext(BaseModel):
             lines.append(f"- Current position in {symbol}: {position.quantity:,.4g} units{price}{listed}")
         if not held:
             lines.append(f"- No current position in {symbol}")
+        for o in self.options_in(symbol):
+            lines.append(f"- Open short {o.option_type}: {o.contracts} x {o.strike:,.2f} strike, "
+                         f"expiry {o.expiry}, sold at {o.entry_premium:,.2f}")
         if self.cash is not None:
             lines.append(f"- Cash available: {self.cash:,.2f}{' ' + self.currency if self.currency else ''}")
         others = [p for p in self.positions if all(p is not h for h in held)]

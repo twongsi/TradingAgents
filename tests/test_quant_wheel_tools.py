@@ -286,3 +286,143 @@ def test_dividends_after_the_analysis_date_are_not_counted(monkeypatch):
     res = analyze_thai_dividend_and_reit_regime("PTT.BK", "2026-05-01")
     assert res["TTM Div (฿/sh)"] == 1.0
     assert res["Last XD Date"] == "2026-04-20"
+
+
+# --- the wheel decision: tiers, holdings, CDC zone, delta target, open options ---
+
+def _trend(spot, ema100, ema200=None, dd=-5.0, cdc="YELLOW"):
+    return {"spot": spot, "ema12": spot, "ema26": spot, "ema100": ema100, "ema200": ema200,
+            "peak_2yr": spot / (1 + dd / 100), "dd_pct": dd,
+            "dist_ema100_pct": (spot / ema100 - 1) * 100, "cdc_zone": cdc}
+
+
+@pytest.fixture
+def market(monkeypatch):
+    """Scripted weekly trend and a clear earnings calendar; returns a setter for the trend."""
+    daily = pd.Series(100 * np.exp(np.cumsum(np.full(60, 0.0)) + np.sin(np.arange(60)) * 0.01),
+                      index=pd.bdate_range(end="2026-11-13", periods=60))
+    monkeypatch.setattr(quant_wheel_tools.wheel_data, "weekly_closes", lambda s, d: _weekly([100.0] * 150))
+    monkeypatch.setattr(quant_wheel_tools.wheel_data, "daily_closes", lambda s, d: daily)
+    monkeypatch.setattr(quant_wheel_tools.wheel_data, "earnings_dates", lambda s: ["2026-10-28", "2027-01-27"])
+    state = {}
+    monkeypatch.setattr(quant_wheel_tools, "_weekly_trend", lambda close: state["trend"])
+
+    def set_trend(**kw):
+        state["trend"] = _trend(**kw)
+    return set_trend
+
+
+def _run(**kw):
+    return quant_wheel_tools.analyze_weekly_wheel_regime("MSFT", "2026-11-13", 35, **kw)
+
+
+def test_tier3_buys_spot_and_offers_no_option(market):
+    market(spot=100.0, ema100=130.0, ema200=110.0, dd=-40.0, cdc="RED")
+    res = _run()
+    assert res["tactical_regime_tier"] == "TIER_3_DEEP_VALUE"
+    assert res["wheel_option_recommendation"] is None
+    assert res["execution_vehicle"] == "EQUITY_SPOT"
+
+
+def test_drawdown_sets_tier2_above_the_ema100_and_says_so(market):
+    market(spot=105.3, ema100=100.0, dd=-26.0, cdc="YELLOW")
+    res = _run()
+    assert res["tactical_regime_tier"] == "TIER_2_ACCUMULATION"
+    assert "overrides EMA100 distance" in res["tier_reason"]
+
+
+def test_tier2_put_is_deeper_in_a_red_weekly_trend(market):
+    market(spot=100.0, ema100=105.0, dd=-10.0, cdc="YELLOW")
+    normal = _run()["wheel_option_recommendation"]["strike_price"]
+    market(spot=100.0, ema100=105.0, dd=-10.0, cdc="RED")
+    red = _run()["wheel_option_recommendation"]["strike_price"]
+    assert normal == 90.0 and red == 85.0
+
+
+def test_tier1_waits_instead_of_selling_a_put_in_a_red_weekly_trend(market):
+    market(spot=103.0, ema100=100.0, dd=-8.0, cdc="RED")
+    res = _run()
+    assert res["tactical_regime_tier"] == "TIER_1_WATCH_ZONE"
+    assert res["wheel_option_recommendation"] is None and res["wheel_action"].startswith("WAIT")
+    market(spot=103.0, ema100=100.0, dd=-8.0, cdc="YELLOW")
+    assert _run()["execution_vehicle"] == "CASH_SECURED_PUT"
+
+
+@pytest.mark.parametrize("shares,vehicle,phrase", [
+    (None, "COVERED_CALL_OVERWRITE", "only if 100+ shares"),
+    (50, "NONE", "NO NEW COVERED CALL (holds 50 shares"),
+    (250, "COVERED_CALL_OVERWRITE", "SELL 2 COVERED CALL"),
+])
+def test_covered_call_depends_on_the_shares_held(market, shares, vehicle, phrase):
+    market(spot=120.0, ema100=100.0, dd=-2.0, cdc="YELLOW")
+    res = _run(shares_held=shares)
+    assert res["tactical_regime_tier"] == "TIER_0_EXTENDED"
+    assert res["execution_vehicle"] == vehicle and phrase in res["wheel_action"]
+    if shares is None:
+        assert any("naked call" in n for n in res["notes"])
+
+
+def test_green_weekly_trend_targets_a_further_call(market):
+    market(spot=120.0, ema100=100.0, dd=-2.0, cdc="GREEN")
+    green = _run(shares_held=100)["wheel_option_recommendation"]
+    market(spot=120.0, ema100=100.0, dd=-2.0, cdc="YELLOW")
+    other = _run(shares_held=100)["wheel_option_recommendation"]
+    assert green["target_delta"] == 0.15 and other["target_delta"] == 0.24
+    assert green["call_strike"] > other["call_strike"]
+
+
+def test_an_unreachable_delta_target_is_flagged():
+    cc = select_optimal_covered_call_strike(spot=100.0, dte_days=35, iv_annual=4.0, target_delta=0.15)
+    assert cc["delta_off_target"] is True
+    assert select_optimal_covered_call_strike(100.0, 35, 0.30, 0.22)["delta_off_target"] is False
+
+
+def test_open_short_options_get_a_roll_verdict(market):
+    market(spot=120.0, ema100=100.0, dd=-2.0, cdc="GREEN")
+    res = _run(shares_held=100, open_options=[
+        {"option_type": "CALL", "strike": 120.0, "expiry": "2026-11-27", "contracts": 1, "entry_premium": 2.0},
+        {"option_type": "PUT", "strike": 90.0, "expiry": "2026-11-13", "contracts": 1, "entry_premium": 1.0},
+    ])
+    challenged, expired = res["open_option_reviews"]
+    assert challenged["remaining_dte"] == 14
+    assert challenged["decision_verdict"].startswith("ROLL_UP")
+    assert challenged["effective_roll_mode"] == "MAX_STRIKE_SHIFT"   # GREEN call
+    assert expired["decision_verdict"].startswith("EXPIRED")
+
+
+def test_tool_reads_holdings_and_open_options_from_the_portfolio(market):
+    market(spot=120.0, ema100=100.0, dd=-2.0, cdc="YELLOW")
+    book = {"positions": [{"ticker": "MSFT", "quantity": 40}],
+            "options": [{"ticker": "MSFT", "option_type": "put", "strike": 100, "expiry": "2026-12-18",
+                         "contracts": 1, "entry_premium": 2.5}]}
+    out = get_weekly_macro_drawdown_regime.invoke(
+        {"symbol": "MSFT", "trade_date": "2026-11-13", "portfolio_book": book})
+    assert "NO NEW COVERED CALL (holds 40 shares" in out
+    assert "open_option_reviews" in out
+    out_no_book = get_weekly_macro_drawdown_regime.invoke({"symbol": "MSFT", "trade_date": "2026-11-13", "portfolio_book": {}})
+    assert "only if 100+ shares" in out_no_book and "open_option_reviews" not in out_no_book
+
+
+def test_shares_under_an_open_call_are_not_offered_again(market):
+    market(spot=120.0, ema100=100.0, dd=-2.0, cdc="YELLOW")
+    open_call = {"option_type": "CALL", "strike": 130.0, "expiry": "2026-12-18", "contracts": 1, "entry_premium": 2.0}
+    res = _run(shares_held=100, open_options=[open_call])
+    assert res["shares_free_for_calls"] == 0
+    assert res["wheel_action"].startswith("NO NEW COVERED CALL") and "100 already under open calls" in res["wheel_action"]
+    assert "SELL 1 COVERED CALL" in _run(shares_held=200, open_options=[open_call])["wheel_action"]
+
+
+def test_a_new_csp_must_fit_in_the_free_cash(market):
+    market(spot=103.0, ema100=100.0, dd=-8.0, cdc="YELLOW")
+    res = _run(cash_available=5_000.0)
+    assert res["wheel_action"].startswith("WAIT (CSP needs 10,000 cash per contract, 5,000 free")
+    assert _run(cash_available=20_000.0)["execution_vehicle"] == "CASH_SECURED_PUT"
+    assert _run()["execution_vehicle"] == "CASH_SECURED_PUT"          # cash unknown: not blocked
+
+
+def test_free_cash_subtracts_open_put_collateral():
+    from tradingagents.portfolio import PortfolioContext
+    book = PortfolioContext.model_validate({"cash": 50_000, "options": [
+        {"ticker": "META", "option_type": "PUT", "strike": 400, "expiry": "2026-12-04", "contracts": 1, "entry_premium": 9}]})
+    assert quant_wheel_tools.free_cash(book) == 10_000
+    assert quant_wheel_tools.free_cash(PortfolioContext()) is None

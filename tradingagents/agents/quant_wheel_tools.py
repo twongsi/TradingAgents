@@ -157,22 +157,39 @@ def compute_black_scholes_call(
     }
 
 
+DELTA_TOLERANCE = 0.05
+
+
 def select_optimal_covered_call_strike(
     spot: float,
     dte_days: int,
     iv_annual: float,
     target_delta: float = 0.22,
     strike_step: float = 5.0,
+    max_strike_mult: float = 1.60,
 ) -> dict:
+    """The call strike whose delta is closest to ``target_delta``.
+
+    Strikes from 3% to ``max_strike_mult`` above spot are tried. When none comes
+    within DELTA_TOLERANCE of the target (a very volatile stock), the closest is
+    returned with ``delta_off_target`` set, so the caller can say so.
+    """
     best_eval = None
     min_diff = 999.0
-    for mult in np.linspace(1.03, 1.25, 45):
+    seen = set()
+    for mult in np.linspace(1.03, max_strike_mult, 120):
         candidate_strike = math.ceil((spot * mult) / strike_step) * strike_step
+        if candidate_strike in seen:
+            continue
+        seen.add(candidate_strike)
         res = compute_black_scholes_call(spot, candidate_strike, dte_days, iv_annual)
         diff = abs(res["call_delta"] - target_delta)
         if diff < min_diff:
             min_diff = diff
             best_eval = res
+    best_eval = dict(best_eval)
+    best_eval["target_delta"] = target_delta
+    best_eval["delta_off_target"] = min_diff > DELTA_TOLERANCE
     return best_eval
 
 
@@ -562,9 +579,73 @@ def analyze_thai_dividend_and_reit_regime(
     }
 
 
-def analyze_weekly_wheel_regime(symbol: str, trade_date: str, dte_days: int = 35) -> dict:
+CONTRACT_SHARES = 100
+IV_SOURCE = "realised 30-day volatility x 1.15, floor 22% (an estimate, not a market quote)"
+
+
+def _tier(spot: float, ema100: float, ema200: float | None, dd_pct: float) -> tuple[str, str]:
+    """The tactical tier and the rule that set it, checked deepest first.
+
+    A drawdown rule can set a deeper tier than the EMA distance alone would: a
+    stock 5% above its EMA100 but 26% off its 2-year high is TIER_2.
+    """
+    dist = (spot / ema100 - 1.0) * 100.0
+    if dd_pct <= -35.0:
+        return "TIER_3_DEEP_VALUE", f"2-year drawdown {dd_pct:.1f}% <= -35%"
+    if ema200 is not None and spot <= ema200 * 1.01:
+        return "TIER_3_DEEP_VALUE", f"close within 1% of or below the Weekly EMA200 ({ema200:.2f})"
+    if spot <= ema100:
+        return "TIER_2_ACCUMULATION", f"close at or below the Weekly EMA100 ({dist:+.1f}%)"
+    if dd_pct <= -20.0:
+        return "TIER_2_ACCUMULATION", f"2-year drawdown {dd_pct:.1f}% <= -20% (overrides EMA100 distance {dist:+.1f}%)"
+    if dist <= 5.0:
+        return "TIER_1_WATCH_ZONE", f"close {dist:+.1f}% above the Weekly EMA100 (0% to 5%)"
+    return "TIER_0_EXTENDED", f"close {dist:+.1f}% above the Weekly EMA100 (> 5%)"
+
+
+def _open_option_reviews(options: list[dict], spot: float, est_iv: float, cdc_zone: str,
+                         trade_date: str, days_to_earnings: int | None) -> list[dict]:
+    """The roll / take-profit / close verdict for each open short option."""
+    reviews = []
+    ref = pd.Timestamp(trade_date)
+    for o in options:
+        remaining = int((pd.Timestamp(o["expiry"]) - ref).days)
+        base = {"option_type": o["option_type"], "strike": o["strike"], "expiry": o["expiry"],
+                "contracts": o["contracts"], "remaining_dte": remaining}
+        if remaining <= 0:
+            reviews.append({**base, "decision_verdict": "EXPIRED_OR_EXPIRING_TODAY (settle or record assignment)"})
+            continue
+        res = evaluate_option_roll_mechanics(
+            option_type=o["option_type"], spot=spot, current_strike=float(o["strike"]),
+            remaining_dte=remaining, entry_premium=float(o["entry_premium"]), iv_annual=est_iv,
+            roll_mode="AUTO_CDC", cdc_zone=cdc_zone, days_to_next_earnings=days_to_earnings,
+            strike_step=5.0 if spot >= 100 else 2.5,
+        )
+        reviews.append({**base,
+                        "current_mark_price": res["current_mark_price"],
+                        "profit_capture_pct": res["profit_capture_pct"],
+                        "effective_roll_mode": res["effective_roll_mode"],
+                        "decision_verdict": res["decision_verdict"],
+                        "selected_roll_plan": res["selected_roll_plan"]})
+    return reviews
+
+
+def analyze_weekly_wheel_regime(
+    symbol: str,
+    trade_date: str,
+    dte_days: int = 35,
+    shares_held: float | None = None,
+    open_options: list[dict] | None = None,
+    cash_available: float | None = None,
+) -> dict:
     """Weekly EMA100/200 tier, CDC zone, earnings gate and the wheel leg for one symbol.
 
+    ``shares_held`` is None when holdings are unknown, so a covered call is then
+    marked as needing 100 shares rather than recommended outright. ``open_options``
+    are the caller's open short options on this symbol, each reviewed for a roll;
+    shares already under an open call are not offered again. ``cash_available`` is
+    free cash after the collateral of every open short put (None when unknown); a
+    new cash-secured put must fit in it.
     Prices are as traded and cut at ``trade_date``. A symbol whose data cannot be
     read comes back with an ``error`` key instead of a recommendation.
     """
@@ -580,34 +661,89 @@ def analyze_weekly_wheel_regime(symbol: str, trade_date: str, dte_days: int = 35
 
     trend = _weekly_trend(close)
     spot, ema100, ema200, dd_pct = trend["spot"], trend["ema100"], trend["ema200"], trend["dd_pct"]
+    cdc = trend["cdc_zone"]
 
     log_rets = np.log(daily / daily.shift(1)).dropna().tail(30)
     est_iv = max(float(log_rets.std() * np.sqrt(252)) * 1.15, 0.22)
     step = 5.0 if spot >= 100 else 2.5
 
-    if dd_pct <= -35.0 or (ema200 is not None and spot <= ema200 * 1.01):
-        tier = "TIER_3_DEEP_VALUE"
-    elif spot <= ema100 or dd_pct <= -20.0:
-        tier = "TIER_2_ACCUMULATION"
-    elif spot <= ema100 * 1.05:
-        tier = "TIER_1_WATCH_ZONE"
-    else:
-        tier = "TIER_0_EXTENDED"
+    open_options = open_options or []
+    calls_open = sum(int(o["contracts"]) for o in open_options if o["option_type"] == "CALL")
+    puts_open = sum(int(o["contracts"]) for o in open_options if o["option_type"] == "PUT")
+    free_shares = None if shares_held is None else max(shares_held - calls_open * CONTRACT_SHARES, 0.0)
 
-    earnings_gate = fetch_ticker_earnings_blackout(sym, trade_date=day, dte_days=dte_days)
+    tier, tier_reason = _tier(spot, ema100, ema200, dd_pct)
+    gate = fetch_ticker_earnings_blackout(sym, trade_date=day, dte_days=dte_days)
+    blocked = gate["is_blackout"]
+    notes = []
+    opt = None
+    if puts_open:
+        notes.append(f"{puts_open} short put(s) already open on {sym}: a new CSP adds to that exposure")
 
-    if tier == "TIER_0_EXTENDED":
-        target_delta = 0.24 if trend["dist_ema100_pct"] >= 15.0 else 0.20
+    def csp_unaffordable(put: dict) -> str | None:
+        """Why a new CSP cannot be secured by the free cash, or None when it can or cash is unknown."""
+        need = put["cash_collateral_1_contract"]
+        if cash_available is not None and cash_available < need:
+            return f"CSP needs {need:,.0f} cash per contract, {cash_available:,.0f} free"
+        return None
+
+    if tier == "TIER_3_DEEP_VALUE":
+        action, vehicle = "BUY 100% SPOT", "EQUITY_SPOT"
+    elif tier == "TIER_2_ACCUMULATION":
+        # In a weekly downtrend (CDC RED) the put is struck deeper, at 85% of spot.
+        put_mult = 0.85 if cdc == "RED" else 0.90
+        opt = compute_black_scholes_put(spot, math.floor((spot * put_mult) / step) * step, dte_days, est_iv)
+        if cdc == "RED":
+            notes.append("CDC RED: put struck at 85% of spot instead of 90%")
+        short_cash = csp_unaffordable(opt)
+        if blocked:
+            action, vehicle = "BUY 50% SPOT ONLY (CSP blocked by earnings gate)", "EQUITY_SPOT"
+        elif short_cash:
+            action, vehicle = f"BUY 50% SPOT ONLY ({short_cash})", "EQUITY_SPOT"
+        else:
+            action, vehicle = "BUY 50% SPOT + SELL CSP", "HYBRID_SPOT_PLUS_CSP"
+    elif tier == "TIER_1_WATCH_ZONE":
+        if cdc == "RED":
+            # A falling weekly trend: no new put at the EMA100 until it turns.
+            action, vehicle = "WAIT (CDC RED: no new CSP until the weekly trend turns)", "NONE"
+        else:
+            opt = compute_black_scholes_put(spot, math.floor(ema100 / step) * step, dte_days, est_iv)
+            short_cash = csp_unaffordable(opt)
+            if blocked:
+                action, vehicle = "WAIT (CSP blocked by earnings gate)", "NONE"
+            elif short_cash:
+                action, vehicle = f"WAIT ({short_cash})", "NONE"
+            else:
+                action, vehicle = "SELL CSP @ WEEKLY EMA100", "CASH_SECURED_PUT"
+    else:  # TIER_0_EXTENDED
+        # A strong weekly uptrend (CDC GREEN) gets a further strike so the call
+        # caps less of the move; otherwise 0.20, or 0.24 when far extended.
+        if cdc == "GREEN":
+            target_delta = 0.15
+            notes.append("CDC GREEN: call targets delta 0.15 to leave room for the uptrend")
+        else:
+            target_delta = 0.24 if trend["dist_ema100_pct"] >= 15.0 else 0.20
         opt = select_optimal_covered_call_strike(spot, dte_days, est_iv, target_delta=target_delta, strike_step=step)
-    else:
-        put_strike = (
-            math.floor(ema100 / step) * step
-            if tier == "TIER_1_WATCH_ZONE"
-            else math.floor((spot * 0.90) / step) * step
-        )
-        opt = compute_black_scholes_put(spot, put_strike, dte_days, est_iv)
+        if opt["delta_off_target"]:
+            notes.append(f"call delta {opt['call_delta']:+.2f} is off the {target_delta:.2f} target: "
+                         "no strike within range reached it (high volatility)")
+        if free_shares is not None and free_shares < CONTRACT_SHARES:
+            covered = f", {calls_open * CONTRACT_SHARES} already under open calls" if calls_open else ""
+            action, vehicle = (f"NO NEW COVERED CALL (holds {shares_held:g} shares{covered}; "
+                               f"needs {CONTRACT_SHARES} uncovered)"), "NONE"
+        elif blocked:
+            action, vehicle = "HOLD SHARES (covered call blocked by earnings gate)", "NONE"
+        elif free_shares is None:
+            action, vehicle = "SELL COVERED CALL (only if 100+ shares are held)", "COVERED_CALL_OVERWRITE"
+            notes.append("holdings unknown: a call without 100 shares per contract is a naked call")
+        else:
+            contracts = int(free_shares // CONTRACT_SHARES)
+            action, vehicle = f"SELL {contracts} COVERED CALL(S)", "COVERED_CALL_OVERWRITE"
 
-    return {
+    if opt is not None and gate.get("days_to_next_earnings") is not None and gate["days_to_next_earnings"] <= dte_days:
+        notes.append("earnings fall inside the option's life: real IV is likely higher than the estimate")
+
+    result = {
         "symbol": sym,
         "close": round(spot, 2),
         "weekly_ema12": round(trend["ema12"], 2),
@@ -616,13 +752,45 @@ def analyze_weekly_wheel_regime(symbol: str, trade_date: str, dte_days: int = 35
         "dist_to_ema100_pct": round(trend["dist_ema100_pct"], 2),
         "weekly_ema200": round(ema200, 2) if ema200 is not None else None,
         "max_2yr_drawdown_pct": round(dd_pct, 2),
-        "cdc_zone": trend["cdc_zone"],
-        "estimated_iv_pct": round(est_iv * 100.0, 2),
+        "cdc_zone": cdc,
         "tactical_regime_tier": tier,
-        "earnings_blackout_gate": earnings_gate,
+        "tier_reason": tier_reason,
+        "earnings_blackout_gate": gate,
+        "wheel_action": action,
+        "execution_vehicle": vehicle,
+        "shares_held": shares_held,
+        "shares_free_for_calls": free_shares,
+        "cash_available": cash_available,
         "wheel_option_recommendation": opt,
-        "option_prices_are_model_estimates": True,
+        "estimated_iv_pct": round(est_iv * 100.0, 2),
+        "iv_source": IV_SOURCE,
+        "notes": notes,
     }
+    if open_options:
+        result["open_option_reviews"] = _open_option_reviews(
+            open_options, spot, est_iv, cdc, day, gate.get("days_to_next_earnings"))
+    return result
+
+
+def free_cash(portfolio) -> float | None:
+    """Cash left after the collateral of every open short put; None when cash is not given."""
+    if portfolio.cash is None:
+        return None
+    held = sum(o.strike * CONTRACT_SHARES * o.contracts for o in portfolio.options if o.option_type == "PUT")
+    return float(portfolio.cash - held)
+
+
+def _book_for(book: dict | None, symbol: str) -> tuple[float | None, list[dict], float | None]:
+    """Shares held, open options on ``symbol`` and free cash from a portfolio dump.
+
+    No book gives (None, [], None): holdings and cash unknown, not zero.
+    """
+    if not book:
+        return None, [], None
+    from tradingagents.portfolio import PortfolioContext
+    portfolio = PortfolioContext.model_validate(book)
+    return (portfolio.shares_in(symbol), [o.model_dump() for o in portfolio.options_in(symbol)],
+            free_cash(portfolio))
 
 
 @tool
@@ -631,13 +799,17 @@ def get_weekly_macro_drawdown_regime(
     benchmark_ticker: Annotated[str, "Macro benchmark to read alongside the asset, e.g. QQQ"] = "QQQ",
     dte_days: Annotated[int, "Target days to expiry for the option leg"] = 35,
     trade_date: Annotated[str, InjectedState("trade_date")] = "",
+    portfolio_book: Annotated[dict, InjectedState("portfolio_book")] = None,
 ) -> str:
     """
-    Weekly EMA100/EMA200 tier, 2-year drawdown, Weekly CDC Action Zone, earnings
-    blackout gate and the options-wheel leg for the instrument under analysis and
-    a macro benchmark, as of the analysis date. Option premiums are Black-Scholes
-    estimates from realised volatility, not market quotes. Thai (.BK) listings
-    have no single-stock options, so for them it reports the dividend/REIT regime.
+    Weekly EMA100/EMA200 tier (with the rule that set it), 2-year drawdown, Weekly
+    CDC Action Zone, earnings blackout gate and the options-wheel action for the
+    instrument under analysis and a macro benchmark, as of the analysis date.
+    With a portfolio it checks the 100 shares a covered call needs and reviews
+    each open short option for a roll, take-profit or close. Option premiums are
+    Black-Scholes estimates from realised volatility, not market quotes. Thai
+    (.BK) listings have no single-stock options, so for them it reports the
+    dividend/REIT regime.
     """
     target = symbol.upper().strip()
     if target.endswith(".BK"):
@@ -646,8 +818,12 @@ def get_weekly_macro_drawdown_regime(
             f"- Target Asset ({target}, SET: no listed single-stock options; dividend regime instead): "
             f"{analyze_thai_dividend_and_reit_regime(target, trade_date)}"
         )
+    shares, options, cash = _book_for(portfolio_book, target)
+    benchmark = analyze_weekly_wheel_regime(benchmark_ticker, trade_date, dte_days)
+    asset = analyze_weekly_wheel_regime(target, trade_date, dte_days, shares_held=shares,
+                                        open_options=options, cash_available=cash)
     return (
         f"As of {_day(trade_date)}:\n"
-        f"- Macro Benchmark ({benchmark_ticker}): {analyze_weekly_wheel_regime(benchmark_ticker, trade_date, dte_days)}\n"
-        f"- Target Asset ({target}): {analyze_weekly_wheel_regime(target, trade_date, dte_days)}"
+        f"- Macro Benchmark ({benchmark_ticker}, for context only): {benchmark}\n"
+        f"- Target Asset ({target}): {asset}"
     )
